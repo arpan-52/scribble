@@ -3,24 +3,13 @@ import threading
 from casacore.tables import table
 import pandas as pd
 import numpy as np
-from bokeh.io import show
 from bokeh.layouts import row, column
-from bokeh.models import Button, Select, MultiSelect, ColumnDataSource, Div, FileInput
+from bokeh.models import Button, Select, MultiSelect, Div, TextInput
 from bokeh.plotting import figure
 import datashader as ds
 import datashader.transfer_functions as tf
-from bokeh.server.server import Server
 
 VIS_COLUMNS = ["DATA", "CORRECTED_DATA", "MODEL_DATA", "RESIDUAL_DATA"]
-
-def list_possible_ms_dirs(path='.'):
-    """List subdirectories that look like Measurement Set files."""
-    candidates = []
-    for f in os.listdir(path):
-        fpath = os.path.join(path, f)
-        if os.path.isdir(fpath) and os.path.exists(os.path.join(fpath, 'TABLES')):
-            candidates.append(f)
-    return candidates
 
 def load_ms_columns(ms_path):
     t = table(ms_path)
@@ -53,7 +42,6 @@ def load_ms_data(ms_path, usecols, corr_idx=None, flag_col=None):
     # Apply flag masking
     if flag_col and flag_col in t.colnames():
         flags = t.getcol(flag_col)
-        # If 3D, need to pick corr axis too
         if flags.ndim == 3 and corr_idx is not None:
             flags = flags[:, :, corr_idx]
         mask = ~flags.flatten()
@@ -81,156 +69,143 @@ def get_corr_labels(ms_path, vis_col):
     return corr_names
 
 def bokeh_app(doc):
-    # State for MS file selection
-    selected_ms = {'path': None}
-
-    file_div = Div(text="<b>Select a Measurement Set (.ms directory):</b>")
-    ms_select = Select(title="MS Directory", options=list_possible_ms_dirs('.'), value=None)
-    reload_btn = Button(label="Refresh List", button_type="default")
-
-    axis_opts = []
-    vis_colinfo = {}
-    flag_col = None
-    select_x = Select(title="X Axis", options=[], value=None)
-    select_y = Select(title="Y Axis", options=[], value=None)
-    select_group = Select(title="Group by", options=["None"], value="None")
-    select_corr = MultiSelect(title="Correlation(s)", options=[], value=[], visible=False)
-    filter_div = Div(text=f"<b>Flag filtering enabled by default (only unflagged visibilities plotted).</b>")
-    plot_button = Button(label="Plot", button_type="success", disabled=True)
-    export_button = Button(label="Export as PNG", button_type="primary", disabled=True)
-    status_div = Div(text="")
-    outfig = figure(width=800, height=450, title="Scribble Plot", tools="pan,wheel_zoom,box_zoom,reset,save")
-    render = outfig.image_rgba([], x=[], y=[], dw=[], dh=[])
-
-    def update_ms_list():
-        ms_select.options = list_possible_ms_dirs('.')
-        ms_select.value = None
-        axis_opts.clear()
-        vis_colinfo.clear()
-        select_x.options = []
-        select_y.options = []
-        select_group.options = ["None"]
-        select_corr.options = []
-        plot_button.disabled = True
-        export_button.disabled = True
-        status_div.text = ""
-        outfig.title.text = "Scribble Plot"
-        render.data_source.data = dict(image=[], x=[], y=[], dw=[], dh=[])
-
-    def ms_chosen(attr, old, new):
-        ms_path = ms_select.value
-        if ms_path:
-            ms_path = os.path.abspath(ms_path)
-            selected_ms['path'] = ms_path
-            colnames, visinfo = load_ms_columns(ms_path)
-            axis_opts[:] = [c for c in colnames if c != 'FLAG']
-            vis_colinfo.clear()
-            vis_colinfo.update(visinfo)
-            select_x.options = axis_opts
-            select_x.value = axis_opts[0]
-            select_y.options = axis_opts
-            select_y.value = axis_opts[1]
-            select_group.options = ["None"] + axis_opts
-            select_group.value = "None"
-            # Is a vis column present?
-            update_corr_visibility()
-            plot_button.disabled = False
-            export_button.disabled = False
-            # Find flag col
-            global flag_col
-            flag_col = 'FLAG' if 'FLAG' in colnames else None
-
-    def update_corr_visibility(*args):
-        inx = select_x.value in vis_colinfo
-        iny = select_y.value in vis_colinfo
-        any_vis = inx or iny
-        select_corr.visible = any_vis
-        if any_vis:
-            # Use whichever is picked for axis
-            viscol = select_x.value if inx else select_y.value
-            corr_labels = get_corr_labels(selected_ms['path'], viscol)
-            select_corr.options = corr_labels
-            if not select_corr.value or set(select_corr.value) - set(corr_labels):
-                select_corr.value = [corr_labels[0]]
-        else:
-            select_corr.options = []
-            select_corr.value = []
-
-    def run_plot():
-        ms_path = selected_ms['path']
-        if not ms_path:
-            status_div.text = "No Measurement Set selected!"
-            return
-        xcol, ycol = select_x.value, select_y.value
-        groupcol = select_group.value if select_group.value != "None" else None
-        usecorr = select_corr.value if select_corr.visible else None
-        corr_idx = None
-        if usecorr and select_corr.visible:
-            corr_labels = select_corr.options
-            corr_idx = corr_labels.index(usecorr[0])
-        usecols = set([xcol, ycol])
-        if groupcol: usecols.add(groupcol)
-        if flag_col: usecols.add(flag_col)
-        for v in VIS_COLUMNS:
-            if xcol == v or ycol == v:
-                usecols.add(v)
-        df = load_ms_data(ms_path, list(usecols), corr_idx=corr_idx, flag_col=flag_col)
-        if df.empty:
-            status_div.text = "No data to plot (possible all flagged/filtered?)"
-            return
-        cvs = ds.Canvas(plot_width=800, plot_height=450)
-        agg = cvs.points(df, xcol, ycol)
-        img = tf.shade(agg, cmap="fire", how="linear").to_pil()
-        arr = np.array(img.convert("RGBA"))
-        arr = np.flipud(arr)
-        buf = np.dstack([arr[:,:,i] for i in range(4)]).view(np.uint32)[...,0]
-        render.data_source.data = dict(
-            image=[buf],
-            x=[df[xcol].min()],
-            y=[df[ycol].min()],
-            dw=[df[xcol].max()-df[xcol].min()],
-            dh=[df[ycol].max()-df[ycol].min()],
-        )
-        outfig.title.text = f"{xcol} vs {ycol}" + (f" ({usecorr[0]})" if usecorr else "")
-        status_div.text = f"Plotted {len(df)} points."
-
-    def export_png():
-        from bokeh.io.export import export_png
-        export_png(outfig, filename="scribble_export.png")
-        status_div.text = "Plot exported to scribble_export.png"
-
-    reload_btn.on_click(update_ms_list)
-    ms_select.on_change("value", ms_chosen)
-    select_x.on_change("value", lambda *args: update_corr_visibility())
-    select_y.on_change("value", lambda *args: update_corr_visibility())
-    plot_button.on_click(run_plot)
-    export_button.on_click(export_png)
-
-    update_ms_list()
-    layout = column(
-        row(file_div, ms_select, reload_btn),
-        row(select_x, select_y, select_group, select_corr),
-        filter_div,
-        row(plot_button, export_button),
+    # Initial GUI: file input and status only
+    info_div = Div(text="<b>Enter/paste full path to your Measurement Set (.ms directory), then click Load.</b>")
+    ms_path_input = TextInput(title="MS Directory", value="", width=500)
+    load_btn = Button(label="Load MS", button_type="success", disabled=False)
+    status_div = Div(text="", width=600)
+    controls_div = Div()
+    plot_layout = column()
+    doc.add_root(column(
+        info_div,
+        row(ms_path_input, load_btn),
         status_div,
-        outfig
-    )
-    doc.add_root(layout)
+        plot_layout  # Populated after an MS is loaded
+    ))
     doc.title = "scribble: Measurement Set Plotter"
+
+    # --- Loading logic ---
+    def on_load():
+        path = ms_path_input.value.strip()
+        if not path or not os.path.isdir(path) or not os.path.exists(os.path.join(path, 'TABLES')):
+            status_div.text = "<span style='color:red;'>Not a valid MS directory path!</span>"
+            plot_layout.children = []
+            return
+
+        status_div.text = f"<b style='color:green;'>Loaded: {os.path.abspath(path)}</b>"
+
+        # Build dynamic selectors and plot controls
+        colnames, vis_colinfo = load_ms_columns(path)
+        axis_opts = [c for c in colnames if c != 'FLAG']
+        flag_col = 'FLAG' if 'FLAG' in colnames else None
+        vis_columns_avail = [c for c in VIS_COLUMNS if c in colnames]
+
+        select_x = Select(title="X Axis", options=axis_opts, value=axis_opts[0])
+        select_y = Select(title="Y Axis", options=axis_opts, value=axis_opts[1])
+        select_group = Select(title="Group by", options=["None"]+axis_opts, value="None")
+        select_corr = MultiSelect(title="Correlation(s)", options=[], value=[], visible=False)
+        filter_div = Div(text=f"<b>Flag filtering enabled: only unflagged visibilities plotted.</b>")
+        plot_button = Button(label="Plot", button_type="success")
+        export_button = Button(label="Export as PNG", button_type="primary", disabled=True)
+        plot_status = Div(text="")
+        outfig = figure(width=800, height=450, title="Scribble Plot", 
+                        tools="pan,wheel_zoom,box_zoom,reset,save")
+        render = outfig.image_rgba([], x=[], y=[], dw=[], dh=[])
+
+        def update_corr_visibility(*args):
+            xval, yval = select_x.value, select_y.value
+            inx = xval in vis_columns_avail
+            iny = yval in vis_columns_avail
+            any_vis = inx or iny
+            select_corr.visible = any_vis
+            if any_vis:
+                viscol = xval if inx else yval
+                corr_labels = get_corr_labels(path, viscol)
+                select_corr.options = corr_labels
+                if not select_corr.value or set(select_corr.value) - set(corr_labels):
+                    select_corr.value = [corr_labels[0]]
+            else:
+                select_corr.options = []
+                select_corr.value = []
+
+        select_x.on_change("value", update_corr_visibility)
+        select_y.on_change("value", update_corr_visibility)
+
+        def run_plot():
+            xcol = select_x.value
+            ycol = select_y.value
+            groupcol = select_group.value if select_group.value != "None" else None
+            usecorr = select_corr.value if select_corr.visible else None
+            corr_idx = None
+            if usecorr and select_corr.visible:
+                corr_labels = select_corr.options
+                corr_idx = corr_labels.index(usecorr[0])
+            usecols = set([xcol, ycol])
+            if groupcol: usecols.add(groupcol)
+            if flag_col: usecols.add(flag_col)
+            for v in vis_columns_avail:
+                if xcol == v or ycol == v:
+                    usecols.add(v)
+            try:
+                df = load_ms_data(path, list(usecols), corr_idx=corr_idx, flag_col=flag_col)
+            except Exception as e:
+                plot_status.text = f"<span style='color:red;'>Error loading MS data: {e}</span>"
+                return
+            if df.empty:
+                plot_status.text = "<span style='color:red;'>No data to plot (all flagged?)</span>"
+                return
+            cvs = ds.Canvas(plot_width=800, plot_height=450)
+            agg = cvs.points(df, xcol, ycol)
+            img = tf.shade(agg, cmap="fire", how="linear").to_pil()
+            arr = np.array(img.convert("RGBA"))
+            arr = np.flipud(arr)
+            buf = np.dstack([arr[:,:,i] for i in range(4)]).view(np.uint32)[...,0]
+            render.data_source.data = dict(
+                image=[buf],
+                x=[df[xcol].min()],
+                y=[df[ycol].min()],
+                dw=[df[xcol].max()-df[xcol].min()],
+                dh=[df[ycol].max()-df[ycol].min()],
+            )
+            outfig.title.text = f"{xcol} vs {ycol}" + (f" ({usecorr[0]})" if usecorr else "")
+            plot_status.text = f"Plotted {len(df)} points."
+            export_button.disabled = False
+
+        plot_button.on_click(run_plot)
+
+        def export_png():
+            from bokeh.io.export import export_png
+            export_png(outfig, filename="scribble_export.png")
+            plot_status.text = "Plot exported to scribble_export.png"
+        export_button.on_click(export_png)
+        export_button.disabled = True
+
+        update_corr_visibility()
+
+        plot_controls = column(
+            row(select_x, select_y, select_group, select_corr),
+            filter_div,
+            row(plot_button, export_button),
+            plot_status,
+            outfig
+        )
+        plot_layout.children = [plot_controls]
+
+    load_btn.on_click(on_load)
+    
 
 def plot_gui(ms_path=None):
     def bk_worker():
-        # If given MS path, immediately load that
+        import socket
+        from bokeh.server.server import Server
         def app_wrapper(doc):
-            if ms_path:
-                # Pre-populate path selection and skip file picker
-                selected_ms = {'path': ms_path}
-                bokeh_app(doc)
-            else:
-                bokeh_app(doc)
+            bokeh_app(doc)
+        # Find open port
+        sock = socket.socket(); sock.bind(('', 0)); port = sock.getsockname()[1]; sock.close()
+        allowed_origins = [f"localhost:{port}", f"127.0.0.1:{port}"]
         server = Server(
             {'/': app_wrapper},
-            port=0, allow_websocket_origin=["localhost:.*", "127.0.0.1:.*"]
+            port=port, allow_websocket_origin=allowed_origins
         )
         server.start()
         import webbrowser
